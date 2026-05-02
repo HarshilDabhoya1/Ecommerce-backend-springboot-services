@@ -1,0 +1,264 @@
+### ─────────────────────────────────────────────────────────────────────────
+### REVIEW SERVICE  —  {{review_service}}
+### Credentials are stored in http-client.private.env.json (git-ignored).
+### Requests 0a–0e set up admin login + test product automatically.
+### ─────────────────────────────────────────────────────────────────────────
+
+### ── SETUP ────────────────────────────────────────────────────────────────
+
+### 0a. Create admin user (409 = already exists, which is fine)
+POST {{user_service}}/users/admin/signup
+Content-Type: application/json
+X-Admin-Secret: {{admin_secret}}
+
+{
+  "name": "{{test_admin_name}}",
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Admin signup failed — check admin_secret. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0b. Login as admin user — captures auth_token for all subsequent requests
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin login returns 200", function() {
+    client.assert(response.status === 200, "Admin login failed — check test_admin_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("auth_token", token);
+    client.log("auth_token captured: " + token);
+    if (response.body !== null) {
+      client.global.set("user_id", response.body.id);
+      client.log("user_id captured: " + response.body.id);
+    }
+  }
+%}
+
+###
+
+### 0c. Create category (409 = already exists, both are fine)
+POST {{product_service}}/categories
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "name": "Electronics"
+}
+
+> {%
+  client.test("Create category returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Expected 201 or 409, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("category_id", response.body.id);
+    client.log("category_id captured from create: " + response.body.id);
+  }
+%}
+
+###
+
+### 0d. Fetch all categories to capture category_id (handles the 409 case from 0c)
+GET {{product_service}}/categories
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  // Always capture from the list — covers both 201 (fresh create) and 409 (already exists).
+  if (response.status === 200 && response.body !== null && Array.isArray(response.body)) {
+    const electronics = response.body.find(function(c) { return c.name === "Electronics"; });
+    if (electronics) {
+      client.global.set("category_id", electronics.id);
+      client.log("category_id captured from list: " + electronics.id);
+    }
+  }
+%}
+
+###
+
+### 0e. Create a test product to review
+POST {{product_service}}/products
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "title": "Test Product for Reviews",
+  "description": "Created by review-service.http setup",
+  "price": 9999.00,
+  "stockQuantity": 10,
+  "categoryId": {{category_id}}
+}
+
+> {%
+  client.test("Create test product returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("product_id", response.body.id);
+    client.log("product_id captured: " + response.body.id);
+  }
+%}
+
+###
+
+### ── REVIEWS ──────────────────────────────────────────────────────────────
+
+### 1. Add a review for a product
+POST {{review_service}}/products/{{product_id}}/reviews
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "rating": 5,
+  "comment": "Absolutely love this phone — best camera I've ever used.",
+  "reviewerName": "{{test_admin_name}}"
+}
+
+> {%
+  client.test("Add review returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Review has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Rating is 5", function() {
+      client.assert(response.body.rating === 5, "Expected rating 5, got " + response.body.rating);
+    });
+    client.test("Comment is not empty", function() {
+      client.assert(typeof response.body.comment === "string" && response.body.comment.length > 0,
+        "comment should be a non-empty string");
+    });
+    client.test("productId matches the product under review", function() {
+      client.assert(response.body.productId === client.global.get("product_id"),
+        "productId in response should match the product we reviewed");
+    });
+    client.global.set("review_id", response.body.id);
+    client.log("Captured review_id: " + response.body.id);
+  }
+%}
+
+###
+
+### 2. Add a second review
+POST {{review_service}}/products/{{product_id}}/reviews
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "rating": 4,
+  "comment": "Great product but a bit too expensive.",
+  "reviewerName": "Test User"
+}
+
+> {%
+  client.test("Second review returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Second review rating is 4", function() {
+      client.assert(response.body.rating === 4, "Expected rating 4, got " + response.body.rating);
+    });
+    client.test("Second review has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Second review id differs from first", function() {
+      client.assert(response.body.id !== client.global.get("review_id"),
+        "Each review should have a unique id");
+    });
+  }
+%}
+
+###
+
+### 3. Add review — validation error (rating out of range 1-5)
+POST {{review_service}}/products/{{product_id}}/reviews
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "rating": 10,
+  "comment": "Invalid rating test",
+  "reviewerName": "Test User"
+}
+
+> {%
+  client.test("Invalid rating returns 400", function() {
+    client.assert(response.status === 400, "Expected 400, got " + response.status);
+  });
+%}
+
+###
+
+### 4. Get all reviews for a product (paginated)
+GET {{review_service}}/products/{{product_id}}/reviews?page=0&size=10
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get reviews returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Response has pagination structure", function() {
+      client.assert(Array.isArray(response.body.content), "content should be an array");
+      client.assert(typeof response.body.totalElements === "number", "totalElements should be a number");
+      client.assert(typeof response.body.totalPages === "number", "totalPages should be a number");
+    });
+    client.test("Reviews list is not empty", function() {
+      client.assert(response.body.content.length > 0, "Expected at least one review");
+    });
+    client.test("totalElements is at least 2 (we added 2 reviews)", function() {
+      client.assert(response.body.totalElements >= 2,
+        "Expected at least 2 reviews, got " + response.body.totalElements);
+    });
+    if (response.body.content.length > 0) {
+      client.test("Each review has required fields", function() {
+        const r = response.body.content[0];
+        client.assert(typeof r.id === "number", "review.id should be a number");
+        client.assert(typeof r.rating === "number" && r.rating >= 1 && r.rating <= 5,
+          "review.rating should be between 1 and 5");
+        client.assert(typeof r.comment === "string" && r.comment.length > 0,
+          "review.comment should be a non-empty string");
+      });
+    }
+  }
+%}
+
+###
+
+### 5. Get reviews for non-existent product — should return empty page (not 404)
+GET {{review_service}}/products/999999/reviews?page=0&size=10
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Non-existent product reviews returns 200 with empty page", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Content array is empty", function() {
+      client.assert(Array.isArray(response.body.content) && response.body.content.length === 0,
+        "Expected empty content array");
+    });
+    client.test("totalElements is 0 for non-existent product", function() {
+      client.assert(response.body.totalElements === 0,
+        "Expected totalElements 0 for unknown product");
+    });
+  }
+%}
