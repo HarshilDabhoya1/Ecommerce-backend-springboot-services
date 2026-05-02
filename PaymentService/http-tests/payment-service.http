@@ -1,0 +1,478 @@
+### ─────────────────────────────────────────────────────────────────────────
+### PAYMENT SERVICE  —  {{payment_service}}
+### Credentials are stored in http-client.private.env.json (git-ignored).
+### Requests 0a–0f set up login + product + order automatically.
+###
+### ⚠️  Payment tests (1–5) require a real Stripe test API key.
+###    Set STRIPE_SECRET_KEY=sk_test_... in PaymentService's run configuration.
+###    Stripe test payment method IDs:
+###      pm_card_visa                            → always succeeds
+###      pm_card_mastercard                      → always succeeds
+###      pm_card_chargeDeclined                  → card_declined
+###      pm_card_chargeDeclinedInsufficientFunds → insufficient_funds
+###      pm_card_chargeDeclinedExpiredCard       → expired_card
+### ─────────────────────────────────────────────────────────────────────────
+
+### ── SETUP ────────────────────────────────────────────────────────────────
+
+### 0a. Create admin user (409 = already exists, which is fine)
+POST {{user_service}}/users/admin/signup
+Content-Type: application/json
+X-Admin-Secret: {{admin_secret}}
+
+{
+  "name": "{{test_admin_name}}",
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Admin signup failed — check admin_secret. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0b. Login as admin user — captures auth_token and user_id
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin login returns 200", function() {
+    client.assert(response.status === 200, "Admin login failed — check test_admin_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("auth_token", token);
+    client.log("auth_token captured: " + token);
+    if (response.body !== null) {
+      client.global.set("user_id", response.body.id);
+      client.log("user_id captured: " + response.body.id);
+    }
+  }
+%}
+
+###
+
+### 0c. Create category (409 = already exists, both are fine)
+POST {{product_service}}/categories
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "name": "Electronics"
+}
+
+> {%
+  client.test("Create category returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Expected 201 or 409, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("category_id", response.body.id);
+    client.log("category_id captured from create: " + response.body.id);
+  }
+%}
+
+###
+
+### 0d. Fetch all categories to capture category_id (handles the 409 case from 0c)
+GET {{product_service}}/categories
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  // Always capture from the list — covers both 201 (fresh create) and 409 (already exists).
+  if (response.status === 200 && response.body !== null && Array.isArray(response.body)) {
+    const electronics = response.body.find(function(c) { return c.name === "Electronics"; });
+    if (electronics) {
+      client.global.set("category_id", electronics.id);
+      client.log("category_id captured from list: " + electronics.id);
+    }
+  }
+%}
+
+###
+
+### 0e. Create a test product (prerequisite)
+POST {{product_service}}/products
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "title": "Test Product for Payments",
+  "description": "Created by payment-service.http setup",
+  "price": 159900.00,
+  "stockQuantity": 100,
+  "categoryId": {{category_id}}
+}
+
+> {%
+  client.test("Create test product returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("product_id", response.body.id);
+    client.log("product_id captured: " + response.body.id);
+  }
+%}
+
+###
+
+### 0f. Place an order (prerequisite for payments)
+POST {{order_service}}/orders
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "items": [
+    {
+      "productId": {{product_id}},
+      "productTitle": "Test Product for Payments",
+      "quantity": 1,
+      "unitPrice": 159900.00
+    }
+  ]
+}
+
+> {%
+  client.test("Place test order returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("order_id", response.body.id);
+    client.log("order_id captured: " + response.body.id);
+  }
+%}
+
+###
+
+### ── PAYMENTS ──────────────────────────────────────────────────────────────
+
+### 1. Initiate a successful payment (Visa — always succeeds in test mode)
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "amount": 159900.00,
+  "currency": "INR",
+  "paymentMethod": "CREDIT_CARD",
+  "stripePaymentMethodId": "pm_card_visa"
+}
+
+> {%
+  client.test("Successful payment returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Payment has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Payment status is SUCCESS", function() {
+      client.assert(response.body.status === "SUCCESS",
+        "Expected SUCCESS, got " + response.body.status);
+    });
+    client.test("Transaction ID is set on success", function() {
+      client.assert(response.body.transactionId !== null && response.body.transactionId !== undefined
+        && response.body.transactionId.length > 0,
+        "transactionId should be a non-empty string on successful payment");
+    });
+    client.test("Amount matches request", function() {
+      client.assert(response.body.amount === 159900.00,
+        "Expected amount 159900.00, got " + response.body.amount);
+    });
+    client.test("Currency matches request", function() {
+      client.assert(response.body.currency === "INR",
+        "Expected currency INR, got " + response.body.currency);
+    });
+    client.test("orderId matches request", function() {
+      client.assert(response.body.orderId == client.global.get("order_id"),
+        "orderId in response should match the order we paid for");
+    });
+    client.global.set("payment_id", response.body.id);
+    client.global.set("transaction_id", response.body.transactionId);
+    client.log("Captured payment_id: " + response.body.id);
+    client.log("Stripe transaction: " + response.body.transactionId);
+  }
+%}
+
+###
+
+### 2. Initiate a declined payment (card_declined)
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "amount": 999.00,
+  "currency": "INR",
+  "paymentMethod": "DEBIT_CARD",
+  "stripePaymentMethodId": "pm_card_chargeDeclined"
+}
+
+> {%
+  client.test("Declined card returns 402", function() {
+    client.assert(response.status === 402, "Expected 402 Payment Required, got " + response.status);
+  });
+  if (response.status === 402 && response.body !== null) {
+    client.test("Payment status is FAILED", function() {
+      client.assert(response.body.status === "FAILED",
+        "Expected FAILED, got " + response.body.status);
+    });
+    client.test("Failure reason is set", function() {
+      client.assert(response.body.failureReason !== null && response.body.failureReason !== undefined
+        && response.body.failureReason.length > 0,
+        "failureReason should be populated for a declined payment");
+    });
+    client.test("Transaction ID is null on failed payment", function() {
+      client.assert(response.body.transactionId === null || response.body.transactionId === undefined,
+        "transactionId should not be set when payment is declined");
+    });
+  }
+%}
+
+###
+
+### 3. Initiate payment — insufficient funds
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "amount": 50000.00,
+  "currency": "INR",
+  "paymentMethod": "UPI",
+  "stripePaymentMethodId": "pm_card_chargeDeclinedInsufficientFunds"
+}
+
+> {%
+  client.test("Insufficient funds returns 402", function() {
+    client.assert(response.status === 402, "Expected 402, got " + response.status);
+  });
+  if (response.status === 402 && response.body !== null) {
+    client.test("Status is FAILED", function() {
+      client.assert(response.body.status === "FAILED",
+        "Expected FAILED, got " + response.body.status);
+    });
+    client.test("Failure reason is present", function() {
+      client.assert(typeof response.body.failureReason === "string" && response.body.failureReason.length > 0,
+        "failureReason should be a non-empty string");
+    });
+  }
+%}
+
+###
+
+### 4. Initiate payment — omit stripePaymentMethodId (defaults to pm_card_visa)
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "amount": 499.00,
+  "currency": "INR",
+  "paymentMethod": "WALLET"
+}
+
+> {%
+  client.test("Default payment method succeeds with 201", function() {
+    client.assert(response.status === 201, "Expected 201 with default pm_card_visa");
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Default payment status is SUCCESS", function() {
+      client.assert(response.body.status === "SUCCESS",
+        "Expected SUCCESS with default Visa card, got " + response.body.status);
+    });
+    client.test("Default payment has a transaction id", function() {
+      client.assert(response.body.transactionId !== null && response.body.transactionId !== undefined,
+        "transactionId should be set on successful default payment");
+    });
+  }
+%}
+
+###
+
+### 5. Initiate payment — USD currency
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "amount": 19.99,
+  "currency": "USD",
+  "paymentMethod": "CREDIT_CARD",
+  "stripePaymentMethodId": "pm_card_mastercard"
+}
+
+> {%
+  client.test("USD payment returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("USD payment status is SUCCESS", function() {
+      client.assert(response.body.status === "SUCCESS",
+        "Expected SUCCESS, got " + response.body.status);
+    });
+    client.test("Currency is stored as USD", function() {
+      client.assert(response.body.currency === "USD",
+        "Expected currency USD, got " + response.body.currency);
+    });
+    client.test("Amount is stored correctly", function() {
+      client.assert(response.body.amount === 19.99,
+        "Expected amount 19.99, got " + response.body.amount);
+    });
+  }
+%}
+
+###
+
+### 6. Initiate payment — validation error (missing amount)
+POST {{payment_service}}/payments
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "orderId": {{order_id}},
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "currency": "INR",
+  "paymentMethod": "CREDIT_CARD"
+}
+
+> {%
+  client.test("Missing amount returns 400", function() {
+    client.assert(response.status === 400, "Expected 400, got " + response.status);
+  });
+%}
+
+###
+
+### 7. Get payment by ID
+GET {{payment_service}}/payments/{{payment_id}}
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get payment returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Payment ID matches", function() {
+      client.assert(response.body.id == client.global.get("payment_id"),
+        "Payment ID mismatch: expected " + client.global.get("payment_id") + " got " + response.body.id);
+    });
+    client.test("Payment status is SUCCESS", function() {
+      client.assert(response.body.status === "SUCCESS",
+        "Expected SUCCESS for the successful Visa payment, got " + response.body.status);
+    });
+    client.test("Payment amount is correct", function() {
+      client.assert(response.body.amount === 159900.00,
+        "Expected amount 159900.00, got " + response.body.amount);
+    });
+    client.test("Payment currency is correct", function() {
+      client.assert(response.body.currency === "INR",
+        "Expected currency INR, got " + response.body.currency);
+    });
+    client.test("Transaction ID matches captured value", function() {
+      client.assert(response.body.transactionId === client.global.get("transaction_id"),
+        "transactionId should match what was returned at creation");
+    });
+  }
+%}
+
+###
+
+### 8. Get payment — non-existent ID should return 404
+GET {{payment_service}}/payments/999999
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Non-existent payment returns 404", function() {
+    client.assert(response.status === 404, "Expected 404, got " + response.status);
+  });
+%}
+
+###
+
+### 9. Get all payments for an order
+GET {{payment_service}}/payments/order/{{order_id}}
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get payments by order returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("At least one payment for this order", function() {
+      client.assert(Array.isArray(response.body) && response.body.length > 0,
+        "Expected at least 1 payment record for order " + client.global.get("order_id"));
+    });
+    if (Array.isArray(response.body) && response.body.length > 0) {
+      client.test("All payments belong to this order", function() {
+        const oid = client.global.get("order_id");
+        response.body.forEach(function(p) {
+          client.assert(p.orderId == oid,
+            "Payment " + p.id + " belongs to orderId " + p.orderId + " not " + oid);
+        });
+      });
+    }
+  }
+%}
+
+###
+
+### 10. Get payment history for a user (paginated)
+GET {{payment_service}}/payments/user/{{user_id}}?page=0&size=10
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("User payment history returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Response has pagination structure", function() {
+      client.assert(Array.isArray(response.body.content), "content should be an array");
+      client.assert(typeof response.body.totalElements === "number", "totalElements should be a number");
+      client.assert(typeof response.body.totalPages === "number", "totalPages should be a number");
+    });
+    client.test("At least one payment in user history", function() {
+      client.assert(response.body.content.length > 0,
+        "Expected at least one payment in history for user " + client.global.get("user_id"));
+    });
+    if (response.body.content.length > 0) {
+      client.test("Each payment record has required fields", function() {
+        const p = response.body.content[0];
+        client.assert(typeof p.id === "number", "payment.id should be a number");
+        client.assert(typeof p.status === "string" && p.status.length > 0,
+          "payment.status should be a non-empty string");
+        client.assert(typeof p.amount === "number" && p.amount > 0,
+          "payment.amount should be a positive number");
+      });
+    }
+  }
+%}
