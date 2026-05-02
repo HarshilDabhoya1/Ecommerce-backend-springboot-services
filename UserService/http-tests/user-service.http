@@ -1,0 +1,176 @@
+### ─────────────────────────────────────────────────────────────────────────
+### USER SERVICE  —  {{user_service}}
+### Credentials are stored in http-client.private.env.json (git-ignored).
+### Run in order: signup → login (captures AUTH_TOKEN) → validate → logout
+### ─────────────────────────────────────────────────────────────────────────
+
+### 1. Sign up — new user (no auth required)
+POST {{user_service}}/users/signup
+Content-Type: application/json
+
+{
+  "name": "{{test_user_name}}",
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("Sign-up returns 201 or 409 (already exists)", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Expected 201 (created) or 409 (already exists), got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Response contains a user id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Response email is present", function() {
+      client.assert(typeof response.body.email === "string" && response.body.email.length > 0,
+        "email field should be present in response");
+    });
+    client.test("Password is not exposed in response", function() {
+      client.assert(response.body.password === undefined || response.body.password === null,
+        "password must never be returned in the response body");
+    });
+  }
+%}
+
+###
+
+### 2. Sign up — duplicate email should return 409 CONFLICT
+POST {{user_service}}/users/signup
+Content-Type: application/json
+
+{
+  "name": "{{test_user_name}}",
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("Duplicate signup returns 409", function() {
+    client.assert(response.status === 409, "Expected 409, got " + response.status);
+  });
+%}
+
+###
+
+### 3. Login — captures AUTH_TOKEN into client global for use in all subsequent requests
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("Login returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.test("AUTH_TOKEN header is present", function() {
+      client.assert(token !== null && token !== undefined && token.length > 0,
+        "AUTH_TOKEN header must be present in login response");
+    });
+    client.global.set("auth_token", token);
+    client.log("Captured AUTH_TOKEN: " + token);
+    if (response.body !== null) {
+      client.test("Response contains user id", function() {
+        client.assert(typeof response.body.id === "number", "id should be a number");
+      });
+      client.test("Response contains user email", function() {
+        client.assert(typeof response.body.email === "string" && response.body.email.length > 0,
+          "email should be a non-empty string");
+      });
+      client.test("Password is not exposed in login response", function() {
+        client.assert(response.body.password === undefined || response.body.password === null,
+          "password must never be returned in the response body");
+      });
+      client.global.set("user_id", response.body.id);
+      client.log("Captured user_id: " + response.body.id);
+    }
+  }
+%}
+
+###
+
+### 4. Login — wrong password should return 401
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_user_email}}",
+  "password": "wrongpassword_intentional"
+}
+
+> {%
+  client.test("Wrong password returns 401", function() {
+    client.assert(response.status === 401, "Expected 401, got " + response.status);
+  });
+  if (response.body !== null) {
+    client.test("Failed login does not return a token in body", function() {
+      client.assert(response.body.token === undefined || response.body.token === null,
+        "No token should be present on a failed login");
+    });
+  }
+%}
+
+###
+
+### 5. Validate token — used internally by the API Gateway
+POST {{user_service}}/users/validate
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Validate returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Validated response contains user id", function() {
+      client.assert(typeof response.body.id === "number" || typeof response.body.userId === "number",
+        "Response should include the user id");
+    });
+    client.test("Validated response contains user email", function() {
+      client.assert(typeof response.body.email === "string" && response.body.email.length > 0,
+        "email should be present and non-empty");
+    });
+  }
+%}
+
+###
+
+### 6. Validate — missing/invalid token should return 401
+POST {{user_service}}/users/validate
+AUTH_TOKEN: invalid-token-xyz
+
+> {%
+  client.test("Invalid token returns 401", function() {
+    client.assert(response.status === 401, "Expected 401, got " + response.status);
+  });
+%}
+
+###
+
+### 7. Logout
+POST {{user_service}}/users/logout
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Logout returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+%}
+
+###
+
+### 8. Validate — token should no longer be valid after logout
+POST {{user_service}}/users/validate
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Token invalid after logout returns 401", function() {
+    client.assert(response.status === 401,
+      "Expected 401 after logout — token should be invalidated");
+  });
+%}
