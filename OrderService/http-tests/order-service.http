@@ -1,0 +1,464 @@
+### ─────────────────────────────────────────────────────────────────────────
+### ORDER SERVICE  —  {{order_service}}
+### Credentials are stored in http-client.private.env.json (git-ignored).
+### Requests 0a–0e set up admin login + test product automatically.
+### ─────────────────────────────────────────────────────────────────────────
+
+### ── SETUP ────────────────────────────────────────────────────────────────
+
+### 0a. Create admin user (409 = already exists, which is fine)
+POST {{user_service}}/users/admin/signup
+Content-Type: application/json
+X-Admin-Secret: {{admin_secret}}
+
+{
+  "name": "{{test_admin_name}}",
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Admin signup failed — check admin_secret. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0a2. Create regular user (for 403 tests — gateway sets X-User-Role from DB, so we need a real USER token)
+POST {{user_service}}/users/signup
+Content-Type: application/json
+
+{
+  "name": "{{test_user_name}}",
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("User signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "User signup failed. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0a3. Login as regular user — captures user_token for 403 tests
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("User login returns 200", function() {
+    client.assert(response.status === 200, "User login failed — check test_user_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("user_token", token);
+    client.log("user_token captured: " + token);
+  }
+%}
+
+###
+
+### 0b. Login as admin user — captures auth_token and user_id
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin login returns 200", function() {
+    client.assert(response.status === 200, "Admin login failed — check test_admin_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("auth_token", token);
+    client.log("auth_token captured: " + token);
+    if (response.body !== null) {
+      client.global.set("user_id", response.body.id);
+      client.log("user_id captured: " + response.body.id);
+    }
+  }
+%}
+
+###
+
+### 0c. Create category (409 = already exists, both are fine)
+POST {{product_service}}/categories
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "name": "Electronics"
+}
+
+> {%
+  client.test("Create category returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Expected 201 or 409, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("category_id", response.body.id);
+    client.log("category_id captured from create: " + response.body.id);
+  }
+%}
+
+###
+
+### 0d. Fetch all categories to capture category_id (handles the 409 case from 0c)
+GET {{product_service}}/categories
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  // Always capture from the list — covers both 201 (fresh create) and 409 (already exists).
+  if (response.status === 200 && response.body !== null && Array.isArray(response.body)) {
+    const electronics = response.body.find(function(c) { return c.name === "Electronics"; });
+    if (electronics) {
+      client.global.set("category_id", electronics.id);
+      client.log("category_id captured from list: " + electronics.id);
+    }
+  }
+%}
+
+###
+
+### 0e. Create a test product (prerequisite for orders)
+POST {{product_service}}/products
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "title": "Test Product for Orders",
+  "description": "Created by order-service.http setup",
+  "price": 159900.00,
+  "stockQuantity": 100,
+  "categoryId": {{category_id}}
+}
+
+> {%
+  client.test("Create test product returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.global.set("product_id", response.body.id);
+    client.log("product_id captured: " + response.body.id);
+  }
+%}
+
+###
+
+### ── ORDERS ───────────────────────────────────────────────────────────────
+
+### 1. Place a new order
+POST {{order_service}}/orders
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "items": [
+    {
+      "productId": {{product_id}},
+      "productTitle": "Test Product for Orders",
+      "quantity": 1,
+      "unitPrice": 159900.00
+    }
+  ]
+}
+
+> {%
+  client.test("Place order returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Order has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Order status is PENDING", function() {
+      client.assert(response.body.status === "PENDING",
+        "Expected PENDING status, got " + response.body.status);
+    });
+    client.test("Order userId matches", function() {
+      client.assert(response.body.userId == client.global.get("user_id"),
+        "userId in response should match the logged-in user");
+    });
+    client.test("Order items are present", function() {
+      client.assert(Array.isArray(response.body.items) && response.body.items.length > 0,
+        "items array should be non-empty");
+    });
+    client.test("Order total amount is positive", function() {
+      client.assert(typeof response.body.totalAmount === "number" && response.body.totalAmount > 0,
+        "totalAmount should be a positive number");
+    });
+    client.global.set("order_id", response.body.id);
+    client.log("Captured order_id: " + response.body.id);
+  }
+%}
+
+###
+
+### 2. Place order — validation error (empty items)
+POST {{order_service}}/orders
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "items": []
+}
+
+> {%
+  client.test("Empty items returns 400", function() {
+    client.assert(response.status === 400, "Expected 400, got " + response.status);
+  });
+%}
+
+###
+
+### 3. Get order by ID
+GET {{order_service}}/orders/{{order_id}}
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get order returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Order has correct ID", function() {
+      client.assert(response.body.id == client.global.get("order_id"),
+        "Order ID mismatch: expected " + client.global.get("order_id") + " got " + response.body.id);
+    });
+    client.test("Order has a status field", function() {
+      client.assert(typeof response.body.status === "string" && response.body.status.length > 0,
+        "status should be a non-empty string");
+    });
+    client.test("Order items are present", function() {
+      client.assert(Array.isArray(response.body.items) && response.body.items.length > 0,
+        "items array should be non-empty");
+    });
+    if (response.body.items !== null && response.body.items.length > 0) {
+      client.test("Order item has productId and quantity", function() {
+        const item = response.body.items[0];
+        client.assert(typeof item.productId === "number", "item.productId should be a number");
+        client.assert(typeof item.quantity === "number" && item.quantity > 0,
+          "item.quantity should be a positive number");
+      });
+    }
+  }
+%}
+
+###
+
+### 4. Get non-existent order — should return 404
+GET {{order_service}}/orders/999999
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Non-existent order returns 404", function() {
+    client.assert(response.status === 404, "Expected 404, got " + response.status);
+  });
+%}
+
+###
+
+### 5. Get orders for a user (paginated)
+GET {{order_service}}/orders/user/{{user_id}}?page=0&size=10&sort=createdAt,desc
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("User orders returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Response has pagination structure", function() {
+      client.assert(Array.isArray(response.body.content), "content should be an array");
+      client.assert(typeof response.body.totalElements === "number", "totalElements should be a number");
+      client.assert(typeof response.body.totalPages === "number", "totalPages should be a number");
+    });
+    client.test("At least one order exists for this user", function() {
+      client.assert(response.body.content.length > 0,
+        "Expected at least one order for user " + client.global.get("user_id"));
+    });
+    if (response.body.content.length > 0) {
+      client.test("All returned orders belong to this user", function() {
+        const uid = client.global.get("user_id");
+        response.body.content.forEach(function(order) {
+          client.assert(order.userId == uid,
+            "Order " + order.id + " belongs to userId " + order.userId + " not " + uid);
+        });
+      });
+    }
+  }
+%}
+
+###
+
+### 6. Admin — update order status PENDING → CONFIRMED
+PATCH {{order_service}}/orders/{{order_id}}/status
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "status": "CONFIRMED"
+}
+
+> {%
+  client.test("Status update returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Status is now CONFIRMED", function() {
+      client.assert(response.body.status === "CONFIRMED",
+        "Expected CONFIRMED, got " + response.body.status);
+    });
+    client.test("Order id is unchanged", function() {
+      client.assert(response.body.id == client.global.get("order_id"),
+        "Order ID should not change on status update");
+    });
+  }
+%}
+
+###
+
+### 7. Admin — update order status CONFIRMED → SHIPPED
+PATCH {{order_service}}/orders/{{order_id}}/status
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "status": "SHIPPED"
+}
+
+> {%
+  client.test("Status update to SHIPPED returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Status is now SHIPPED", function() {
+      client.assert(response.body.status === "SHIPPED",
+        "Expected SHIPPED, got " + response.body.status);
+    });
+  }
+%}
+
+###
+
+### 8. Admin — invalid backward transition SHIPPED → PENDING should return 409
+PATCH {{order_service}}/orders/{{order_id}}/status
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "status": "PENDING"
+}
+
+> {%
+  client.test("Backward status transition returns 409", function() {
+    client.assert(response.status === 409, "Expected 409, got " + response.status);
+  });
+%}
+
+###
+
+### 9. Place a second order (for cancel test)
+POST {{order_service}}/orders
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+
+{
+  "userId": {{user_id}},
+  "userEmail": "{{test_admin_email}}",
+  "items": [
+    {
+      "productId": {{product_id}},
+      "productTitle": "Test Product for Orders",
+      "quantity": 2,
+      "unitPrice": 159900.00
+    }
+  ]
+}
+
+> {%
+  client.test("Second order returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Second order status is PENDING", function() {
+      client.assert(response.body.status === "PENDING",
+        "New order should start as PENDING, got " + response.body.status);
+    });
+    client.global.set("order_id_to_cancel", response.body.id);
+    client.log("Captured order_id_to_cancel: " + response.body.id);
+  }
+%}
+
+###
+
+### 10. Cancel the second order
+PATCH {{order_service}}/orders/{{order_id_to_cancel}}/cancel
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Cancel order returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Status is CANCELLED", function() {
+      client.assert(response.body.status === "CANCELLED",
+        "Expected CANCELLED, got " + response.body.status);
+    });
+    client.test("Cancelled order id matches", function() {
+      client.assert(response.body.id == client.global.get("order_id_to_cancel"),
+        "Order ID should match the cancelled order");
+    });
+  }
+%}
+
+###
+
+### 11. Cancel already-cancelled order — should return 409
+PATCH {{order_service}}/orders/{{order_id_to_cancel}}/cancel
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Double cancel returns 409", function() {
+    client.assert(response.status === 409, "Expected 409, got " + response.status);
+  });
+%}
+
+###
+
+### 12. Non-admin status update — should return 403
+### Uses user_token so the gateway injects X-User-Role: USER automatically.
+### X-User-Role: USER is also set manually for dev mode (direct to service, no gateway).
+PATCH {{order_service}}/orders/{{order_id}}/status
+Content-Type: application/json
+AUTH_TOKEN: {{user_token}}
+X-User-Role: USER
+
+{
+  "status": "DELIVERED"
+}
+
+> {%
+  client.test("Non-admin status update returns 403", function() {
+    client.assert(response.status === 403, "Expected 403, got " + response.status);
+  });
+%}
