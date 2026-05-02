@@ -1,0 +1,429 @@
+### ─────────────────────────────────────────────────────────────────────────
+### PRODUCT SERVICE  —  {{product_service}}
+### Credentials are stored in http-client.private.env.json (git-ignored).
+### Request #0 below logs in automatically — no need to run user-service.http first.
+### Admin endpoints require X-User-Role: ADMIN header.
+### ─────────────────────────────────────────────────────────────────────────
+
+### ── SETUP: Create admin + regular user, login as admin ─────────────────────
+
+### 0a. Create admin test user (safe to run multiple times — 409 means already exists)
+POST {{user_service}}/users/admin/signup
+Content-Type: application/json
+X-Admin-Secret: {{admin_secret}}
+
+{
+  "name": "{{test_admin_name}}",
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Admin signup failed — check admin_secret in http-client.private.env.json. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0b. Create regular user (for 403 tests — gateway sets role from DB, so we need a real USER token)
+POST {{user_service}}/users/signup
+Content-Type: application/json
+
+{
+  "name": "{{test_user_name}}",
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("User signup returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "User signup failed. Got: " + response.status);
+  });
+%}
+
+###
+
+### 0c. Login as regular user — captures user_token for 403 tests
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_user_email}}",
+  "password": "{{test_user_password}}"
+}
+
+> {%
+  client.test("User login returns 200", function() {
+    client.assert(response.status === 200, "User login failed — check test_user_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("user_token", token);
+    client.log("user_token captured: " + token);
+  }
+%}
+
+###
+
+### 0d. Login as admin user — captures auth_token used for all write operations
+POST {{user_service}}/users/login
+Content-Type: application/json
+
+{
+  "email": "{{test_admin_email}}",
+  "password": "{{test_admin_password}}"
+}
+
+> {%
+  client.test("Admin login returns 200", function() {
+    client.assert(response.status === 200, "Admin login failed — check test_admin_email/password in http-client.private.env.json");
+  });
+  if (response.status === 200) {
+    const token = response.headers.valueOf("AUTH_TOKEN");
+    client.global.set("auth_token", token);
+    client.log("auth_token captured: " + token);
+    if (response.body !== null) {
+      client.global.set("user_id", response.body.id);
+      client.log("user_id captured: " + response.body.id);
+    }
+  }
+%}
+
+###
+
+### ── CATEGORIES ─────────────────────────────────────────────────────────────
+
+### 1. Create a category (ADMIN only) — 409 means already exists from a prior run, both are fine
+POST {{product_service}}/categories
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "name": "Electronics"
+}
+
+> {%
+  client.test("Create category returns 201 or 409", function() {
+    client.assert(response.status === 201 || response.status === 409,
+      "Expected 201 (created) or 409 (already exists), got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Category has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Category name matches", function() {
+      client.assert(response.body.name === "Electronics", "Expected name 'Electronics'");
+    });
+    client.global.set("category_id", response.body.id);
+    client.log("Captured category_id: " + response.body.id);
+  }
+%}
+
+###
+
+### 1b. Fetch all categories to capture category_id (handles the 409 case from #1)
+GET {{product_service}}/categories
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  // Always capture from the list — covers both 201 (fresh create) and 409 (already exists).
+  // Using falsy check because client.global.get() returns undefined (not null) for unset keys.
+  if (response.status === 200 && response.body !== null && Array.isArray(response.body)) {
+    const electronics = response.body.find(function(c) { return c.name === "Electronics"; });
+    if (electronics) {
+      client.global.set("category_id", electronics.id);
+      client.log("Captured category_id from list: " + electronics.id);
+    }
+  }
+%}
+
+###
+
+### 2. Create a category — non-admin (USER role token) should get 403
+### Uses user_token so the gateway injects X-User-Role: USER automatically.
+### X-User-Role: USER is also set manually for dev mode (direct to service, no gateway).
+POST {{product_service}}/categories
+Content-Type: application/json
+AUTH_TOKEN: {{user_token}}
+X-User-Role: USER
+
+{
+  "name": "Books"
+}
+
+> {%
+  client.test("Non-admin create category returns 403", function() {
+    client.assert(response.status === 403, "Expected 403, got " + response.status);
+  });
+%}
+
+###
+
+### ── PRODUCTS ────────────────────────────────────────────────────────────────
+
+### 3. Create a product (ADMIN only)
+POST {{product_service}}/products
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "title": "iPhone 16 Pro",
+  "description": "Apple iPhone 16 Pro — 256GB, Natural Titanium",
+  "price": 134900.00,
+  "stockQuantity": 50,
+  "categoryId": {{category_id}}
+}
+
+> {%
+  client.test("Create product returns 201", function() {
+    client.assert(response.status === 201, "Expected 201, got " + response.status);
+  });
+  if (response.status === 201 && response.body !== null) {
+    client.test("Product has a valid id", function() {
+      client.assert(typeof response.body.id === "number", "id should be a number");
+    });
+    client.test("Product title matches", function() {
+      client.assert(response.body.title === "iPhone 16 Pro", "Expected title 'iPhone 16 Pro'");
+    });
+    client.test("Product price matches", function() {
+      client.assert(response.body.price === 134900.00, "Expected price 134900.00");
+    });
+    client.test("Product stockQuantity matches", function() {
+      client.assert(response.body.stockQuantity === 50, "Expected stockQuantity 50");
+    });
+    client.test("New product is not soft-deleted", function() {
+      client.assert(response.body.deletedAt === null || response.body.deletedAt === undefined,
+        "deletedAt should be null for a new product");
+    });
+    client.global.set("product_id", response.body.id);
+    client.global.set("product_title", response.body.title);
+    client.log("Captured product_id: " + response.body.id);
+  }
+%}
+
+###
+
+### 4. Get all products (any authenticated user)
+GET {{product_service}}/products
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get all products returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Response is an array", function() {
+      client.assert(Array.isArray(response.body), "Expected response body to be an array");
+    });
+    client.test("Products list is not empty", function() {
+      client.assert(response.body.length > 0, "Expected at least one product");
+    });
+    if (response.body.length > 0) {
+      client.test("First product has required fields", function() {
+        const p = response.body[0];
+        client.assert(typeof p.id === "number", "product.id should be a number");
+        client.assert(typeof p.title === "string" && p.title.length > 0, "product.title should be non-empty");
+        client.assert(typeof p.price === "number" && p.price > 0, "product.price should be positive");
+      });
+    }
+  }
+%}
+
+###
+
+### 5. Get products paginated
+GET {{product_service}}/products/page?page=0&size=5&sort=price,desc
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Paginated products returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Response has pagination structure", function() {
+      client.assert(Array.isArray(response.body.content), "content should be an array");
+      client.assert(typeof response.body.totalElements === "number", "totalElements should be a number");
+      client.assert(typeof response.body.totalPages === "number", "totalPages should be a number");
+      client.assert(typeof response.body.size === "number", "size should be a number");
+      client.assert(typeof response.body.number === "number", "number (page index) should be a number");
+    });
+    client.test("Page size is at most 5", function() {
+      client.assert(response.body.content.length <= 5, "Page content should not exceed requested size of 5");
+    });
+    client.test("At least one product in page", function() {
+      client.assert(response.body.content.length > 0, "Expected at least one product on page 0");
+    });
+  }
+%}
+
+###
+
+### 6. Search products by title
+GET {{product_service}}/products/search?title=iPhone&minPrice=1000&maxPrice=200000
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Search products returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Search result has pagination structure", function() {
+      client.assert(Array.isArray(response.body.content), "content should be an array");
+      client.assert(typeof response.body.totalElements === "number", "totalElements should be a number");
+    });
+    if (response.body.content !== null && response.body.content.length > 0) {
+      client.test("Search results match keyword", function() {
+        const title = response.body.content[0].title.toLowerCase();
+        client.assert(title.includes("iphone"), "First result title should contain 'iphone'");
+      });
+      client.test("Search results respect price range", function() {
+        response.body.content.forEach(function(p) {
+          client.assert(p.price >= 1000 && p.price <= 200000,
+            "Product price " + p.price + " is outside the requested range");
+        });
+      });
+    }
+  }
+%}
+
+###
+
+### 7. Get product by ID
+GET {{product_service}}/products/{{product_id}}
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Get product by ID returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Product id matches captured id", function() {
+      client.assert(response.body.id === client.global.get("product_id"),
+        "Product ID mismatch: expected " + client.global.get("product_id") + " got " + response.body.id);
+    });
+    client.test("Product title is not empty", function() {
+      client.assert(typeof response.body.title === "string" && response.body.title.length > 0,
+        "title should be a non-empty string");
+    });
+    client.test("Product price is positive", function() {
+      client.assert(typeof response.body.price === "number" && response.body.price > 0,
+        "price should be a positive number");
+    });
+    client.test("Product stockQuantity is non-negative", function() {
+      client.assert(typeof response.body.stockQuantity === "number" && response.body.stockQuantity >= 0,
+        "stockQuantity should be >= 0");
+    });
+  }
+%}
+
+###
+
+### 8. Get product — non-existent ID should return 404
+GET {{product_service}}/products/999999
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Non-existent product returns 404", function() {
+    client.assert(response.status === 404, "Expected 404, got " + response.status);
+  });
+%}
+
+###
+
+### 9. Update product (ADMIN only)
+PUT {{product_service}}/products/{{product_id}}
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "title": "iPhone 16 Pro Max",
+  "description": "Apple iPhone 16 Pro Max — 512GB, Desert Titanium",
+  "price": 159900.00,
+  "stockQuantity": 30,
+  "categoryId": {{category_id}}
+}
+
+> {%
+  client.test("Update product returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Updated title reflects new value", function() {
+      client.assert(response.body.title === "iPhone 16 Pro Max",
+        "Expected title 'iPhone 16 Pro Max', got " + response.body.title);
+    });
+    client.test("Updated price reflects new value", function() {
+      client.assert(response.body.price === 159900.00,
+        "Expected price 159900.00, got " + response.body.price);
+    });
+    client.test("Updated stockQuantity reflects new value", function() {
+      client.assert(response.body.stockQuantity === 30,
+        "Expected stockQuantity 30, got " + response.body.stockQuantity);
+    });
+    client.test("Product id is unchanged after update", function() {
+      client.assert(response.body.id === client.global.get("product_id"),
+        "Product ID should not change on update");
+    });
+  }
+%}
+
+###
+
+### 10. Update stock (ADMIN only)
+PATCH {{product_service}}/products/{{product_id}}/stock
+Content-Type: application/json
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+{
+  "quantity": 100
+}
+
+> {%
+  client.test("Update stock returns 200", function() {
+    client.assert(response.status === 200, "Expected 200, got " + response.status);
+  });
+  if (response.status === 200 && response.body !== null) {
+    client.test("Stock quantity updated to 100", function() {
+      client.assert(response.body.stockQuantity === 100,
+        "Expected stockQuantity 100, got " + response.body.stockQuantity);
+      // Note: StockUpdateDto uses field name 'quantity', but the product response returns 'stockQuantity'
+    });
+    client.test("Product id is unchanged after stock update", function() {
+      client.assert(response.body.id === client.global.get("product_id"),
+        "Product ID should not change on stock update");
+    });
+  }
+%}
+
+###
+
+### 11. Soft-delete product (ADMIN only)
+DELETE {{product_service}}/products/{{product_id}}
+AUTH_TOKEN: {{auth_token}}
+X-User-Role: ADMIN
+
+> {%
+  client.test("Delete product returns 204", function() {
+    client.assert(response.status === 204, "Expected 204, got " + response.status);
+  });
+%}
+
+###
+
+### 12. Confirm soft-delete — deleted product should now return 404
+GET {{product_service}}/products/{{product_id}}
+AUTH_TOKEN: {{auth_token}}
+
+> {%
+  client.test("Soft-deleted product returns 404", function() {
+    client.assert(response.status === 404,
+      "Expected 404 after soft-delete, got " + response.status);
+  });
+%}
